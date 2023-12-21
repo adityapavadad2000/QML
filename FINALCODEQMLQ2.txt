@@ -1,0 +1,203 @@
+# ---- Import libraries ----
+import matplotlib.pyplot as plt
+from gurobipy import *
+import numpy as np
+import csv
+
+
+# ---- Parameters ----
+
+"""Importing the dataset and extracting the appropriate data"""
+
+filename = "dddd.txt"
+
+
+with open(filename) as f:
+    data = csv.reader(f, delimiter="\t")
+    dataset = list(data)
+
+for i in range(0,len(dataset)):
+    for j in range(0,7):
+        a = int(dataset[i][j])
+        dataset[i][j] = a
+        
+dataset = np.array(dataset)
+node_id = dataset[:, 0]  # Stores the id's of the nodes
+x_coord = dataset[:, 1]  # Stores the x coordinates of all the nodes
+y_coord = dataset[:, 2]  # Stores the y coordinates of all the nodes
+a = dataset[:, 3]  # Stores the demand for each node
+RT = dataset[:, 4]  # Stores the ready time for each node (earliest time for delivery)
+DT = dataset[:, 5]  # Stores the due time for each node (latest time for delivery)
+ST = dataset[:, 6]  # Stores the service time for each node (time needed for a delivery at each location )
+
+
+
+"""Parameters"""
+
+
+# Capacities for each vehicle, with the commented out sections being for each case
+
+b = np.array([300,300,300,300,300,300])  # Case 1
+Dc = np.array([5, 0, 0])
+
+
+# Total number of vehicles
+K = len(b)
+
+"""Calculating the Euclidean distance between all nodes """
+
+D = np.zeros((len(a), len(a)))
+
+
+for i in range(len(node_id)):
+    for j in range(len(node_id)):
+        Distance = np.linalg.norm((x_coord[i] - x_coord[j], y_coord[i] - y_coord[j]))
+        D[i , j] = round(Distance , 2)
+        
+
+# Note for this programme, the assumption is made that 1 distance unit corresponds to 1 time unit
+# This also allows us to use distance interchangably within constraints with time
+
+
+# ---- Initialising Model ----
+
+model = Model("Part c/d")
+
+
+# ---- Sets and Indices ----
+g=3
+I = range(len(node_id))  # locations
+J = range(len(node_id))  # locations
+depots = range(g)
+customers = range(g, len(node_id))
+V = range(K)  # vehicles
+
+# ---- Decision Variables ----
+
+"""Initialising the dimensions for all the decision variables"""
+x = model.addVars(I, J, V, vtype = GRB.BINARY, name = "If_Route_Travelled")
+t = model.addVars(I, V, vtype = GRB.CONTINUOUS, name = "Service_Start_Time")
+    
+# # ---- Integerate the variables into the model ----
+model.update()
+
+# Objective: Minimize the total distance traveled by all vehicles
+objective = quicksum(D[i, j] * x[i, j, v] for i in I for j in J for v in V if i != j)
+model.setObjective(objective, GRB.MINIMIZE)
+
+
+model.update()
+
+# # ---- Constraints ----
+
+M = 3000
+
+# Constraint 1: Each customer is visited exactly once
+single_visit = model.addConstrs(
+    (quicksum(x[i, j, v] for j in J for v in V if j != i) == 1 for i in customers),
+    "Single_Visit_Satisfaction")
+
+
+# Constraint 2: Not exceeding the total number of vehicles
+depot_vehicle_num = model.addConstr(
+    (quicksum(x[d, j, v] for j in customers for v in V for d in depots) <= K),
+    "Vehicle_Leaving_Depot")
+
+
+# Constraint 4: Vehicle capacity is not exceeded
+
+vehicle_cap = model.addConstrs(
+    (quicksum(a[j] * x[i, j, v] for j in customers for i in I if i != j) <= b[v] for v in V ),
+    name="Vehicle_Capacity")
+
+# Constraint: Each vehicle returns to the same depot it left from
+return_to_same_depot = model.addConstrs(
+    (quicksum(x[i, j, v] for j in customers) == quicksum(x[j, i, v] for j in customers) 
+     for i in depots for v in V),
+    "Return_To_Same_Depot")
+
+
+# Constraint 5: Each vehicle must leave from exactly one depot
+unique_depot_start = model.addConstrs(
+    (quicksum(x[d, j, v] for d in depots for j in customers) == 1 for v in V),
+    "Unique_Depot_Start")
+
+# Constraint 6: Each vehicle must return to a depot
+vehicle_return = model.addConstrs(
+    (quicksum(x[j, d, v] for j in customers if j != d) == quicksum(x[d, j, v] for j in customers if j != d) for d in depots for v in V),
+    "Vehicle_Return_To_Original_Depot")
+
+
+# Constraint 7: Route continuity (flow conservation)
+route_flow_customers = model.addConstrs(
+    (quicksum(x[i, j, v] for j in customers if i != j) +
+     quicksum(x[i, d, v] for d in depots) - 
+     quicksum(x[j, i, v] for j in customers if i != j) -
+     quicksum(x[d, i, v] for d in depots) == 0 for i in customers for v in V),
+    "Maintaining_Route_Flow_Customers")
+
+
+route_flow_depots = model.addConstrs(
+    (quicksum(x[d, j, v] for j in customers) - 
+     quicksum(x[j, d, v] for j in customers) == 0 for d in depots for v in V),
+    "Maintaining_Route_Flow_Depots")
+
+
+
+# Constraint 8: Service start time is within the ready time and due time
+service_start_time = model.addConstrs(
+    (t[i, v] >= RT[i] for i in customers for v in V),
+    "Service_Start_Not_Before_Ready_Time")
+
+service_end_time = model.addConstrs(
+    (t[i, v] <= DT[i] for i in I for v in V),
+    "Service_End_Before_Due_Time")
+
+# Constraint 9: No self return
+no_self_return_customers = model.addConstrs(
+    (x[i, i, v] == 0 for i in customers for v in V),
+    "No_Self_Return_Customers")
+
+no_self_return_depots = model.addConstrs(
+    (x[d, d, v] == 0 for d in depots for v in V),
+    "No_Self_Return_Depots")
+
+
+# Constraint 10: Service time window with travel time and service time consideration
+
+customers_list = list(customers)
+depots_list = list(depots)
+
+service_time_window_extended = model.addConstrs(
+    (t[j, v] >= t[i, v] + ST[i] + D[i, j] - M * (1 - x[i, j, v])
+     for i in customers_list + depots_list for j in customers_list for v in V if i != j),
+    "Extended_Service_Time_Window")
+
+
+
+# Enable detailed output logging
+model.setParam("OutputFlag", True)  # Set to True to enable logging
+
+# Set the optimality gap (e.g., 0.05% or 0.0005)
+model.setParam("MIPGap", 0.0005)
+
+# Set a time limit for the solver (in seconds, e.g., 1800 seconds)
+model.setParam("TimeLimit", 1800)
+
+# Optionally, adjust the heuristic efforts (value between 0 and 1)
+# model.setParam("Heuristics", 0.5)
+
+# Update the model to apply the parameters
+model.update()
+
+# Now, optimize the model
+model.optimize()
+
+# After optimization, you can access the MIPGap
+if model.SolCount > 0:
+    mip_gap = model.MIPGap
+    print("Optimality Gap:", mip_gap)
+else:
+    print("No solution found or solver did not reach optimality gap within time limit.")
+
+
